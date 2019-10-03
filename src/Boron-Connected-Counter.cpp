@@ -2,7 +2,7 @@
 //       THIS IS A GENERATED FILE - DO NOT EDIT       //
 /******************************************************/
 
-#line 1 "/Users/chipmc/Documents/Maker/Particle/Projects/Cellular-Pressure-Next/src/Cellular-Pressure-Next.ino"
+#line 1 "/Users/chipmc/Documents/Maker/Particle/Projects/Boron-Connected-Counter/src/Boron-Connected-Counter.ino"
 /*
 * Project Cellular-MMA8452Q - converged software for Low Power and Solar
 * Description: Cellular Connected Data Logger for Utility and Solar powered installations
@@ -104,20 +104,14 @@ bool meterParticlePublish(void);
 void publishStateTransition(void);
 void fullModemReset();
 void dailyCleanup();
-#line 70 "/Users/chipmc/Documents/Maker/Particle/Projects/Cellular-Pressure-Next/src/Cellular-Pressure-Next.ino"
+#line 70 "/Users/chipmc/Documents/Maker/Particle/Projects/Boron-Connected-Counter/src/Boron-Connected-Counter.ino"
 #include "Adafruit_FRAM_I2C.h"                      // Library for FRAM functions
 #include "FRAM-Library-Extensions.h"                // Extends the FRAM Library
 #include "electrondoc.h"                            // Documents pinout
 #include "ConnectionEvents.h"                       // Stores information on last connection attemt in memory
 #include "BatteryCheck.h"
 
-//PRODUCT_ID(4441);                                   // Connected Counter Header
-//PRODUCT_VERSION(5);
-const char releaseNumber[6] = "7";                  // Displays the release on the menu ****  this is not a production release ****
-
-// PRODUCT_ID(10089);                                  // Santa Cruz Counter
-// PRODUCT_VERSION(2);
-// const char releaseNumber[6] = "7";                  // Displays the release on the menu ****  this is not a production release ****
+const char releaseNumber[6] = "1";                  // Displays the release on the menu ****  this is not a production release ****
 
 // Prototypes and System Mode calls
 SYSTEM_MODE(SEMI_AUTOMATIC);                        // This will enable user code to start executing automatically.
@@ -136,21 +130,6 @@ State state = INITIALIZATION_STATE;
 State oldState = INITIALIZATION_STATE;
 
 
-#if (PLATFORM_ID == PLATFORM_ELECTRON_PRODUCTION)
-// Pin Constants - Electron Carrier Board
-const int tmp36Pin =      A0;                       // Simple Analog temperature sensor
-const int wakeUpPin =     A7;                       // This is the Particle Electron WKP pin
-const int tmp36Shutdwn =  B5;                       // Can turn off the TMP-36 to save energy
-const int hardResetPin =  D4;                       // Power Cycles the Electron and the Carrier Board
-const int donePin =       D6;                       // Pin the Electron uses to "pet" the watchdog
-const int blueLED =       D7;                       // This LED is on the Electron itself
-const int userSwitch =    D5;                       // User switch with a pull-up resistor
-// Pin Constants - Sensor
-const int intPin =        B1;                       // Pressure Sensor inerrupt pin
-const int analogIn =      B2;                       // This pin sees the raw output of the pressure sensor
-const int disableModule = B3;                       // Bringining this low turns on the sensor (pull-up on sensor board)
-const int ledPower =      B4;                       // Allows us to control the indicator LED on the sensor board
-#else
 // Pin Constants - Boron Carrier Board
 const int tmp36Pin =      A4;                       // Simple Analog temperature sensor
 const int wakeUpPin =     D8;                       // This is the Particle Electron WKP pin
@@ -164,7 +143,6 @@ const int intPin =        MOSI;                       // Pressure Sensor inerrup
 const int analogIn =      SCK;                       // This pin sees the raw output of the pressure sensor
 const int disableModule = SS;                       // Bringining this low turns on the sensor (pull-up on sensor board)
 const int ledPower =      MISO;                       // Allows us to control the indicator LED on the sensor board
-#endif
 
 // Timing Variables
 const int wakeBoundary = 1*3600 + 0*60 + 0;         // 1 hour 0 minutes 0 seconds
@@ -189,7 +167,7 @@ bool connectionMode;                                // Need to store if we are g
 bool solarPowerMode;                                // Changes the PMIC settings
 bool verboseMode;                                   // Enables more active communications for configutation and setup
 char SignalString[64];                              // Used to communicate Wireless RSSI and Description
-const char* radioTech[8] = {"Unknown","None","WiFi","GSM","UMTS","CDMA","LTE","IEEE802154"};
+
 
 // Time Related Variables
 int openTime;                                       // Park Opening time - (24 hr format) sets waking
@@ -228,8 +206,6 @@ void setup()                                        // Note: Disconnected Setup(
   pinMode(analogIn,INPUT);                          // Not used but don't want it floating
   pinMode(userSwitch,INPUT);                        // Momentary contact button on board for direct user input
   pinMode(blueLED, OUTPUT);                         // declare the Blue LED Pin as an output
-  //pinMode(tmp36Shutdwn,OUTPUT);                     // Supports shutting down the TMP-36 to save juice
-  //digitalWrite(tmp36Shutdwn, HIGH);                 // Turns on the temp sensor
   pinResetFast(donePin);
   pinResetFast(hardResetPin);
   // Pressure / PIR Module Pin Setup
@@ -239,7 +215,7 @@ void setup()                                        // Note: Disconnected Setup(
   pinMode(ledPower,OUTPUT);                         // Turn on the lights
   pinSetFast(ledPower);                             // Turns on the LED on the pressure sensor board
 
-  //pinMode(donePin,OUTPUT);                          // Allows us to pet the watchdog
+  pinMode(donePin,OUTPUT);                          // Allows us to pet the watchdog
   pinMode(hardResetPin,OUTPUT);                     // For a hard reset active HIGH
 
   petWatchdog();                                    // Pet the watchdog - not necessary in a power on event but just in case
@@ -597,10 +573,13 @@ void takeMeasurements()
 
 void getSignalStrength()
 {
+  const char* radioTech[9] = {"Unknown","None","WiFi","GSM","UMTS","CDMA","LTE","IEEE802154","CAT M1"};
   // New Signal Strength capability - https://community.particle.io/t/boron-lte-and-cellular-rssi-funny-values/45299/8
   CellularSignal sig = Cellular.RSSI();
 
   auto rat = sig.getAccessTechnology();
+
+  //Particle.publish("rat",String(rat),PRIVATE);
 
   //float strengthVal = sig.getStrengthValue();
   float strengthPercentage = sig.getStrength();
@@ -951,7 +930,7 @@ void fullModemReset() {  // Adapted form Rikkas7's https://github.com/rickkas7/e
 	}
 	// Reset the modem and SIM card
 	// 16:MT silent reset (with detach from network and saving of NVM parameters), with reset of the SIM card
-	Cellular.command(30000, "AT+CFUN=16\r\n");
+	Cellular.command(30000, "AT+CFUN=15\r\n");
 	delay(1000);
 	// Go into deep sleep for 10 seconds to try to reset everything. This turns off the modem as well.
 	System.sleep(SLEEP_MODE_DEEP, 10);
