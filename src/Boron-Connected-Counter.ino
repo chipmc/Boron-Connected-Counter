@@ -535,13 +535,11 @@ void takeMeasurements()
 
 void getSignalStrength()
 {
-  const char* radioTech[9] = {"Unknown","None","WiFi","GSM","UMTS","CDMA","LTE","IEEE802154","CAT M1"};
+  const char* radioTech[10] = {"Unknown","None","WiFi","GSM","UMTS","CDMA","LTE","IEEE802154","LTE_CAT_M1","LTE_CAT_NB1"};
   // New Signal Strength capability - https://community.particle.io/t/boron-lte-and-cellular-rssi-funny-values/45299/8
   CellularSignal sig = Cellular.RSSI();
 
   auto rat = sig.getAccessTechnology();
-
-  //Particle.publish("rat",String(rat),PRIVATE);
 
   //float strengthVal = sig.getStrengthValue();
   float strengthPercentage = sig.getStrength();
