@@ -14,12 +14,13 @@
 
 //v1    - Adapted from the Particle Electron version Cellular Pressure next
 //v1.01 - Added code for daylight savings time
+//v1.02 - Added the currentHourlyPeriod variable
 
 // Particle Product definitions
 //PRODUCT_ID(4441);                                   // Connected Counter Header
 //PRODUCT_VERSION(1);
 #define DSTRULES isDSTusa
-char currentPointRelease[5] ="1.01"
+char currentPointRelease[5] ="1.02";
 
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
@@ -107,6 +108,7 @@ unsigned long stayAwake;                            // Stores the time we need t
 unsigned long webhookTimeStamp = 0;                 // Webhooks...
 unsigned long resetTimeStamp = 0;                   // Resets - this keeps you from falling into a reset loop
 char currentOffsetStr[10];                          // What is our offset from UTC
+int currentHourlyPeriod = 0;                        // Need to keep this separate from time so we know when to report
 
 // Program Variables
 bool awokeFromNap = false;                          // In low power mode, we can't use standard millis to debounce
@@ -213,14 +215,11 @@ void setup()                                        // Note: Disconnected Setup(
 
   snprintf(debounceStr,sizeof(debounceStr),"%2.1f sec", (float)sysStatus.debounce/1000.0);
 
-  Serial.print("Open time: ");
-  Serial.print(sysStatus.openTime);
-  Serial.print(" and close time: ");
-  Serial.println(sysStatus.closeTime);
-
   Time.setDSTOffset(sysStatus.dstOffset);                                // Set the value from FRAM if in limits     
   if (Time.isValid()) DSTRULES() ? Time.beginDST() : Time.endDST();     // Perform the DST calculation here 
   Time.zone(sysStatus.timezone);                                      // Set the Time Zone for our device 
+  if (current.hourlyCount) currentHourlyPeriod = Time.hour(current.lastCountTime);
+  else currentHourlyPeriod = Time.hour();                                  // The local time hourly period for reporting purposes
 
   rtc.setup();                                                        // Start the real time clock
 
@@ -267,24 +266,16 @@ void loop()
   switch(state) {
   case IDLE_STATE:                                                    // Where we spend most time - note, the order of these conditionals is important
     if (sysStatus.verboseMode && state != oldState) publishStateTransition();
-    if (watchdogFlag) {
-      petWatchdog();                                                  // Watchdog flag is raised - time to pet the watchdog
-      if (Particle.connected() && sysStatus.verboseMode) {
-        waitUntil(meterParticlePublish);
-        Particle.publish("Watchdog","Petted",PRIVATE);
-      }
-    }
+    if (watchdogFlag) petWatchdog();                                  // Watchdog flag is raised - time to pet the watchdog
     if (sensorDetect) recordCount();                                  // The ISR had raised the sensor flag
-    if (current.hourlyCountInFlight) {                  // Cleared here as there could be counts coming in while "in Flight"
-      current.hourlyCount -= current.hourlyCountInFlight;  // Confirmed that count was recevied - clearing
-      current.hourlyCountInFlight = 0;                  // Zero out the counts until next reporting period
-      current.maxMinValue = 0;
-      current.alertCount = 0;
+    if (current.hourlyCountInFlight) {                                // Cleared here as there could be counts coming in while "in Flight"
+      current.hourlyCount -= current.hourlyCountInFlight;             // Confirmed that count was recevied - clearing
+      current.hourlyCountInFlight = current.maxMinValue = current.alertCount = 0; // Zero out the counts until next reporting period
       currentCountsWriteNeeded=true;
       if (Time.hour() == 0) resetEverything();                        // We have reported for the previous day - reset for the next - only needed if no sleep
     }
     if (sysStatus.lowPowerMode && (millis() - stayAwakeTimeStamp) > stayAwake) state = NAPPING_STATE;  // When in low power mode, we can nap between taps
-    if (Time.hour() != Time.hour(current.lastCountTime)) state = REPORTING_STATE;  // We want to report on the hour but not after bedtime
+    if (Time.hour() != currentHourlyPeriod) state = REPORTING_STATE;  // We want to report on the hour but not after bedtime
     if ((Time.hour() > sysStatus.closeTime || Time.hour() < sysStatus.openTime)) state = SLEEPING_STATE;   // The park is closed - sleep
     break;
 
@@ -432,7 +423,7 @@ void sendEvent() {
   snprintf(data, sizeof(data), "{\"hourly\":%i, \"daily\":%i,\"battery\":%i, \"temp\":%i, \"resets\":%i, \"alerts\":%i, \"maxmin\":%i}",current.hourlyCount, current.dailyCount, sysStatus.stateOfCharge, current.temperature, sysStatus.resetCount, current.alertCount, current.maxMinValue);
   Particle.publish("Ubidots-Car-Hook", data, PRIVATE);
   webhookTimeStamp = millis();
-  if(Time.hour() == 00) current.hourlyCount++;                        // Ensures we don't have a zero here at midnigtt
+  currentHourlyPeriod = Time.hour();
   current.hourlyCountInFlight = current.hourlyCount;                  // This is the number that was sent to Ubidots - will be subtracted once we get confirmation
   dataInFlight = true;                                                // set the data inflight flag
 }
