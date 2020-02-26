@@ -24,6 +24,7 @@
 //v1.03 - Need to fix reporting that is not aligning with the hour
 //v2.00 - Updated to new deivceOS and implemented checking for sysStatus
 //v2.01 - Minor fixes, removed deep sleep (need to switch to RTC), controlled sysStatus.connectedStatus
+//v2.02 - Working on making sleep mode work.  24 hour operations require close time to 24.
 
 // Particle Product definitions
 void setup();
@@ -62,11 +63,11 @@ void dailyCleanup();
 int setDSTOffset(String command);
 bool isDSTusa();
 bool isDSTnz();
-#line 23 "/Users/chipmc/Documents/Maker/Particle/Projects/Boron-Connected-Counter/src/Boron-Connected-Counter.ino"
-PRODUCT_ID(10864);                                   // Boron Connected Counter Header
+#line 24 "/Users/chipmc/Documents/Maker/Particle/Projects/Boron-Connected-Counter/src/Boron-Connected-Counter.ino"
+PRODUCT_ID(10864);                                  // Boron Connected Counter Header
 PRODUCT_VERSION(2);
 #define DSTRULES isDSTusa
-char currentPointRelease[5] ="2.01";
+char currentPointRelease[5] ="2.02";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -119,7 +120,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);                        // This will enable user cod
 SYSTEM_THREAD(ENABLED);                             // Means my code will not be held up by Particle processes.
 STARTUP(System.enableFeature(FEATURE_RESET_INFO));
 FuelGauge batteryMonitor;                           // Prototype for the fuel gauge (included in Particle core library)
-SystemPowerConfiguration conf;                     // Initalize the PMIC class so you can call the Power Management functions below.
+SystemPowerConfiguration conf;                      // Initalize the PMIC class so you can call the Power Management functions below.
 MCP79410 rtc;                                       // Rickkas MCP79410 libarary
 MB85RC64 fram(Wire, 0);                             // Rickkas' FRAM library
 
@@ -168,8 +169,6 @@ volatile bool sensorDetect = false;                 // This is the flag that an 
 
 void setup()                                        // Note: Disconnected Setup()
 {
-  Serial.begin();
-  Serial.println("Setup begins");
   /* Setup is run for three reasons once we deploy a sensor:
        1) When you deploy the sensor
        2) Each hour while the device is sleeping
@@ -228,7 +227,7 @@ void setup()                                        // Note: Disconnected Setup(
   // Load FRAM and reset variables to their correct values
   fram.begin();                                                       // Initialize the FRAM module
 
-  int tempVersion;
+  byte tempVersion;
   fram.get(FRAM::versionAddr, tempVersion);
   if (tempVersion != FRAMversionNumber) {                             // Check to see if the memory map in the sketch matches the data on the chip
     fram.erase();                                                     // Reset the FRAM to correct the issue
@@ -269,20 +268,13 @@ void setup()                                        // Note: Disconnected Setup(
   // Here is where the code diverges based on why we are running Setup()
   // Deterimine when the last counts were taken check when starting test to determine if we reload values or start counts over
   if (Time.day() != Time.day(current.lastCountTime)) {    // ******  - These are debug lines
-    Serial.println("We are resetting everything");
-    Serial.print("Time.day() = ");
-    Serial.print(Time.day());
-    Serial.print(" and the last day is: ");
-    Serial.print(Time.day(current.lastCountTime));
-    Serial.print(" because ");
-    Serial.println(current.lastCountTime);
-    //resetEverything();                                               // Zero the counts for the new day
+    resetEverything();                                               // Zero the counts for the new day
     if (sysStatus.solarPowerMode && !sysStatus.lowPowerMode) {
       setLowPowerMode("1");                                           // If we are running on solar, we will reset to lowPowerMode at Midnight
     }
   }
 
-  if ((Time.hour() > sysStatus.closeTime || Time.hour() < sysStatus.openTime)) {} // The park is closed - don't connect
+  if ((Time.hour() >= sysStatus.closeTime || Time.hour() < sysStatus.openTime)) {} // The park is closed - don't connect
   else {                                                              // Park is open let's get ready for the day
     attachInterrupt(intPin, sensorISR, RISING);                       // Pressure Sensor interrupt from low to high
     if (sysStatus.connectedStatus && !Particle.connected()) connectToParticle(); // Only going to connect if we are in connectionMode
@@ -293,9 +285,6 @@ void setup()                                        // Note: Disconnected Setup(
   pinResetFast(ledPower);                                             // Turns off the LED on the sensor board
 
   if (state == INITIALIZATION_STATE) state = IDLE_STATE;              // IDLE unless otherwise from above code
-
-  Serial.println("Exiting Setup");
-  sysStatus.verboseMode = true;                // *****  This is a debug line - delete when production
 }
 
 void loop()
@@ -316,7 +305,7 @@ void loop()
     systemStatusWriteNeeded = currentCountsWriteNeeded = false;
     if (sysStatus.lowPowerMode && (millis() - stayAwakeTimeStamp) > stayAwake) state = NAPPING_STATE;  // When in low power mode, we can nap between taps
     if (Time.hour() != currentHourlyPeriod) state = REPORTING_STATE;  // We want to report on the hour but not after bedtime
-    if ((Time.hour() > sysStatus.closeTime || Time.hour() < sysStatus.openTime)) state = SLEEPING_STATE;   // The park is closed - sleep
+    if ((Time.hour() >= sysStatus.closeTime || Time.hour() < sysStatus.openTime)) state = SLEEPING_STATE;   // The park is closed - sleep
     break;
 
   case SLEEPING_STATE: {                                              // This state is triggered once the park closes and runs until it opens
@@ -329,8 +318,10 @@ void loop()
     }
     if (sysStatus.connectedStatus) disconnectFromParticle();          // Disconnect cleanly from Particle
     digitalWrite(blueLED,LOW);                                        // Turn off the LED
+    petWatchdog();
     int wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);
-    System.sleep(userSwitch,FALLING,wakeInSeconds);                      // Very deep sleep till the next hour - then resets
+    rtc.setAlarm(wakeInSeconds);                                      // Very deep sleep till the next hour - then resets
+    System.sleep(SLEEP_MODE_SOFTPOWEROFF);                            // Sleeps then the RTC will wake on D8
     } break;
 
   case NAPPING_STATE: {  // This state puts the device in low power mode quickly
@@ -342,7 +333,7 @@ void loop()
     petWatchdog();                                                    // Reset the watchdog timer interval
     System.sleep(intPin, RISING, wakeInSeconds);                      // Sensor will wake us with an interrupt or timeout at the hour
     if (sensorDetect) {                                               // Executions starts here after sleep - time or sensor interrupt?
-      awokeFromNap=true;                                             // Since millis() stops when sleeping - need this to debounce
+      awokeFromNap=true;                                              // Since millis() stops when sleeping - need this to debounce
       stayAwakeTimeStamp = millis();
     }
     state = IDLE_STATE;                                               // Back to the IDLE_STATE after a nap - not enabling updates here as napping is typicallly disconnected
@@ -350,19 +341,23 @@ void loop()
 
   case REPORTING_STATE:
     if (sysStatus.verboseMode && state != oldState) publishStateTransition();
-    if (!sysStatus.connectedStatus) connectToParticle();    // Only attempt to connect if not already New process to get connected
+    if (!sysStatus.connectedStatus) connectToParticle();              // Only attempt to connect if not already New process to get connected
     if (Particle.connected()) {
-      if (Time.hour() == sysStatus.closeTime) dailyCleanup();         // Once a day, clean house
+      if (Time.hour() == sysStatus.openTime) dailyCleanup();          // Once a day, clean house
       takeMeasurements();                                             // Update Temp, Battery and Signal Strength values
       sendEvent();                                                    // Send data to Ubidots
       state = RESP_WAIT_STATE;                                        // Wait for Response
     }
-    else state = ERROR_STATE;
+    else {
+      resetTimeStamp = millis();
+      state = ERROR_STATE;
+    }
+    if (sysStatus.lowPowerMode) Time.setTime(rtc.getRTCTime());
     break;
 
   case RESP_WAIT_STATE:
     if (sysStatus.verboseMode && state != oldState) publishStateTransition();
-    if (!dataInFlight)  {                                               // Response received back to IDLE state
+    if (!dataInFlight)  {                                             // Response received back to IDLE state
       stayAwake = stayAwakeLong;                                      // Keeps Electron awake after reboot - helps with recovery
       stayAwakeTimeStamp = millis();
       state = IDLE_STATE;
@@ -459,22 +454,22 @@ void sendEvent() {
 }
 
 void UbidotsHandler(const char *event, const char *data) {            // Looks at the response from Ubidots - Will reset Photon if no successful response                                                                   
-  char dataCopy[strlen(data)+1];                                      // Response Template: "{{hourly.0.status_code}}" so, I should only get a 3 digit number back
-  strncpy(dataCopy, data, sizeof(dataCopy));                          // data needs to be copied since if (Particle.connected()) Particle.publish() will clear it
-  if (!strlen(dataCopy)) {                                            // Copy - overflow safe
-    waitUntil(meterParticlePublish);                                  // First check to see if there is any data
-    if (Particle.connected()) Particle.publish("Ubidots Hook", "No Data", PRIVATE);
-    return;
+  char responseString[64];
+    // Response is only a single number thanks to Template
+  if (!strlen(data)) {                                                // No data in response - Error
+    snprintf(responseString, sizeof(responseString),"No Data");
   }
-  int responseCode = atoi(dataCopy);                                  // Response is only a single number thanks to Template
-  if ((responseCode == 200) || (responseCode == 201))
-  {
-    waitUntil(meterParticlePublish);
-    if (Particle.connected()) Particle.publish("State","Response Received", PRIVATE);
-    current.lastCountTime = Time.now();                               // Record the last successful Webhook Response
+  else if (atoi(data) == 200 || atoi(data) == 201) {
+    snprintf(responseString, sizeof(responseString),"Response Received");
+    sysStatus.lastHookResponse = Time.now();                          // Record the last successful Webhook Response
+    systemStatusWriteNeeded = true;
     dataInFlight = false;                                             // Data has been received
   }
-  else if (Particle.connected()) Particle.publish("Ubidots Hook", dataCopy, PRIVATE);                    // Publish the response code
+  else {
+    snprintf(responseString, sizeof(responseString), "Unknown response recevied %i",atoi(data));
+  }
+  waitUntil(meterParticlePublish);
+  Particle.publish("Ubidots Hook", responseString, PRIVATE);
 }
 
 // These are the functions that are part of the takeMeasurements call
@@ -564,7 +559,7 @@ void loadSystemDefaults() {                                         // Default s
   sysStatus.timezone = -5;                                          // Default is East Coast Time
   sysStatus.dstOffset = 1;
   sysStatus.openTime = 0;
-  sysStatus.closeTime = 23;
+  sysStatus.closeTime = 24;
 
   fram.put(FRAM::systemStatusAddr,sysStatus);                       // Write it now since this is a big deal and I don't want values over written
 }
@@ -587,7 +582,7 @@ void checkSystemValues() {                                          // Checks to
   if (sysStatus.timezone < -12 || sysStatus.timezone > 12) sysStatus.timezone = -5;
   if (sysStatus.dstOffset < 0 || sysStatus.dstOffset > 2) sysStatus.dstOffset = 1;
   if (sysStatus.openTime < 0 || sysStatus.openTime > 12) sysStatus.openTime = 0;
-  if (sysStatus.closeTime < 12 || sysStatus.closeTime > 23) sysStatus.closeTime = 23;
+  if (sysStatus.closeTime < 12 || sysStatus.closeTime > 24) sysStatus.closeTime = 24;
   // None for lastHookResponse
 
   systemStatusWriteNeeded = true;
@@ -786,7 +781,7 @@ int setCloseTime(String command)
   char * pEND;
   char data[256];
   int tempTime = strtol(command,&pEND,10);                       // Looks for the first integer and interprets it
-  if ((tempTime < 0) || (tempTime > 23)) return 0;   // Make sure it falls in a valid range or send a "fail" result
+  if ((tempTime < 0) || (tempTime > 24)) return 0;   // Make sure it falls in a valid range or send a "fail" result
   sysStatus.closeTime = tempTime;
   systemStatusWriteNeeded = true;                          // Store the new value in FRAMwrite8
   snprintf(data, sizeof(data), "Closing time set to %i",sysStatus.closeTime);
