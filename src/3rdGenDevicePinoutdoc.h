@@ -11,8 +11,8 @@
  * D16 - A3 -
  * D15 - A4 -               TMP32 Temp Sensor
  * D14 - A5 / SPI SS -      disableModule
- * D13 - SCK - SPI Clock - 
- * D12 - MO - SPI MOSI -    intPin
+ * D13 - SCK - SPI Clock -  intPin
+ * D12 - MO - SPI MOSI -    
  * D11 - MI - SPI MISO -    ledPower
  * D10 - UART RX -
  * D9 - UART TX -

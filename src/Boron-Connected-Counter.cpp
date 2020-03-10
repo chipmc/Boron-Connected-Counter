@@ -2,7 +2,7 @@
 //       THIS IS A GENERATED FILE - DO NOT EDIT       //
 /******************************************************/
 
-#include "application.h"
+#include "Particle.h"
 #line 1 "/Users/chipmc/Documents/Maker/Particle/Projects/Boron-Connected-Counter/src/Boron-Connected-Counter.ino"
 /*
 * Project Cellular-MMA8452Q - converged software for Low Power and Solar
@@ -25,6 +25,9 @@
 //v2.00 - Updated to new deivceOS and implemented checking for sysStatus
 //v2.01 - Minor fixes, removed deep sleep (need to switch to RTC), controlled sysStatus.connectedStatus
 //v2.02 - Working on making sleep mode work.  24 hour operations require close time to 24.
+//v2.03 - Rewrote the Ubidots handler, fixed some minor errors, added time offset string
+//v2.04 - Updated the PMIC stuff
+//v2.05 - Fixed bug in main loop - not resetting FRAM write needed flags
 
 // Particle Product definitions
 void setup();
@@ -63,11 +66,11 @@ void dailyCleanup();
 int setDSTOffset(String command);
 bool isDSTusa();
 bool isDSTnz();
-#line 24 "/Users/chipmc/Documents/Maker/Particle/Projects/Boron-Connected-Counter/src/Boron-Connected-Counter.ino"
+#line 27 "/Users/chipmc/Documents/Maker/Particle/Projects/Boron-Connected-Counter/src/Boron-Connected-Counter.ino"
 PRODUCT_ID(10864);                                  // Boron Connected Counter Header
 PRODUCT_VERSION(2);
 #define DSTRULES isDSTusa
-char currentPointRelease[5] ="2.02";
+char currentPointRelease[5] ="2.05";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -81,10 +84,10 @@ const int FRAMversionNumber = 2;                    // Increment this number eac
 
 struct systemStatus_structure {                     // currently 14 bytes long
   uint8_t structuresVersion;                        // Version of the data structures (system and data)
-  uint8_t placeholder;                              // available for future use                      
+  uint8_t placeholder;                              // available for future use
   uint8_t metricUnits;                              // Status of key system states
   uint8_t connectedStatus;
-  uint8_t verboseMode; 
+  uint8_t verboseMode;
   uint8_t solarPowerMode;
   uint8_t lowPowerMode;
   uint8_t lowBatteryMode;
@@ -138,8 +141,8 @@ const int donePin =       D5;                       // Pin the Electron uses to 
 const int blueLED =       D7;                       // This LED is on the Electron itself
 const int userSwitch =    D4;                       // User switch with a pull-up resistor
 // Pin Constants - Sensor
-const int intPin =        MOSI;                     // Pressure Sensor inerrupt pin
-const int disableModule = SS;                       // Bringining this low turns on the sensor (pull-up on sensor board)
+const int intPin =        SCK;                     // Pressure Sensor inerrupt pin
+const int disableModule = MOSI;                       // Bringining this low turns on the sensor (pull-up on sensor board)
 const int ledPower =      MISO;                     // Allows us to control the indicator LED on the sensor board
 
 // Timing Variables
@@ -247,9 +250,11 @@ void setup()                                        // Note: Disconnected Setup(
 
   snprintf(debounceStr,sizeof(debounceStr),"%2.1f sec", (float)sysStatus.debounce/1000.0);
 
-  Time.setDSTOffset(sysStatus.dstOffset);                              // Set the value from FRAM if in limits     
-  if (Time.isValid()) DSTRULES() ? Time.beginDST() : Time.endDST();    // Perform the DST calculation here 
-  Time.zone(sysStatus.timezone);                                       // Set the Time Zone for our device 
+  Time.setDSTOffset(sysStatus.dstOffset);                              // Set the value from FRAM if in limits
+  if (!Time.isValid()) Time.setTime(rtc.getRTCTime());
+  DSTRULES() ? Time.beginDST() : Time.endDST();    // Perform the DST calculation here
+  Time.zone(sysStatus.timezone);                                       // Set the Time Zone for our device
+  snprintf(currentOffsetStr,sizeof(currentOffsetStr),"%2.1f UTC",(Time.local() - Time.now()) / 3600.0);   // Load the offset string
 
   rtc.setup();                                                        // Start the real time clock
 
@@ -300,8 +305,14 @@ void loop()
       currentCountsWriteNeeded=true;
       if (Time.hour() == 0) resetEverything();                        // We have reported for the previous day - reset for the next - only needed if no sleep
     }
-    if (systemStatusWriteNeeded) fram.put(FRAM::systemStatusAddr,sysStatus);
-    if (currentCountsWriteNeeded) fram.put(FRAM::currentCountsAddr,current);
+    if (systemStatusWriteNeeded) {
+      fram.put(FRAM::systemStatusAddr,sysStatus);
+      systemStatusWriteNeeded = false;
+    }
+    if (currentCountsWriteNeeded) {
+      fram.put(FRAM::currentCountsAddr,current);
+      currentCountsWriteNeeded = false;
+    }
     systemStatusWriteNeeded = currentCountsWriteNeeded = false;
     if (sysStatus.lowPowerMode && (millis() - stayAwakeTimeStamp) > stayAwake) state = NAPPING_STATE;  // When in low power mode, we can nap between taps
     if (Time.hour() != currentHourlyPeriod) state = REPORTING_STATE;  // We want to report on the hour but not after bedtime
@@ -328,7 +339,7 @@ void loop()
     if (sysStatus.verboseMode && state != oldState) publishStateTransition();
     if (sensorDetect) break;                                          // Don't nap until we are done with event
     if (sysStatus.connectedStatus) disconnectFromParticle();          // If we are in connected mode we need to Disconnect from Particle
-    stayAwake = sysStatus.debounce;                                   // Once we come into this function, we need to reset stayAwake as it changes at the top of the hour                                                 
+    stayAwake = sysStatus.debounce;                                   // Once we come into this function, we need to reset stayAwake as it changes at the top of the hour
     int wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);
     petWatchdog();                                                    // Reset the watchdog timer interval
     System.sleep(intPin, RISING, wakeInSeconds);                      // Sensor will wake us with an interrupt or timeout at the hour
@@ -453,7 +464,7 @@ void sendEvent() {
   current.hourlyCountInFlight = current.hourlyCount;                  // This is the number that was sent to Ubidots - will be subtracted once we get confirmation
 }
 
-void UbidotsHandler(const char *event, const char *data) {            // Looks at the response from Ubidots - Will reset Photon if no successful response                                                                   
+void UbidotsHandler(const char *event, const char *data) {            // Looks at the response from Ubidots - Will reset Photon if no successful response
   char responseString[64];
     // Response is only a single number thanks to Template
   if (!strlen(data)) {                                                // No data in response - Error
@@ -531,16 +542,22 @@ void petWatchdog()
 // Power Management function
 void PMICreset() {
   if (sysStatus.solarPowerMode) {
-    conf.powerSourceMinVoltage(4840);                                 // Set the lowest input voltage to 4.84 volts best setting for 6V solar panels
-    conf.powerSourceMaxCurrent(900);                                  // default is 900mA
-    conf.batteryChargeCurrent(512);                              // default is 512mA matches my 3W panel
-    conf.batteryChargeVoltage(4208);                                     // Allows us to charge cloe to 100% - battery can't go over 45 celcius
+    conf.powerSourceMaxCurrent(900)                                  // default is 900mA
+    .powerSourceMinVoltage(5080)                                     // Set the lowest input voltage to 5.080 volts best setting for 6V solar panels
+    .batteryChargeCurrent(1024)                                      // default is 512mA matches my 3W panel
+    .batteryChargeVoltage(4208)                                      // Allows us to charge cloe to 100% - battery can't go over 45 celcius
+    .feature(SystemPowerFeature::PMIC_DETECTION)
+    .feature(SystemPowerFeature::USE_VIN_SETTINGS_WITH_USB_HOST) ;
+    System.setPowerConfiguration(conf);
   }
   else  {
-    conf.powerSourceMinVoltage(4208);                                 // This is the default value for the Electron
-    conf.powerSourceMaxCurrent(1500);                                 // default is 900mA this let's me charge faster
-    conf.batteryChargeCurrent(1000);                              // default is 2048mA (011000) = 512mA+1024mA+512mA)
-    conf.batteryChargeVoltage(4112);                                     // default is 4.112V termination voltage
+    conf.powerSourceMaxCurrent(1500)                                 // default is 900mA this let's me charge faster
+    .powerSourceMinVoltage(4208)                                     // This is the default value for the Boron
+    .batteryChargeCurrent(1024)                                      // default is 2048mA (011000) = 512mA+1024mA+512mA)
+    .batteryChargeVoltage(4112)                                      // default is 4.112V termination voltage
+    .feature(SystemPowerFeature::PMIC_DETECTION)
+    .feature(SystemPowerFeature::USE_VIN_SETTINGS_WITH_USB_HOST) ;
+    System.setPowerConfiguration(conf);
   }
 }
 
@@ -570,11 +587,11 @@ void checkSystemValues() {                                          // Checks to
   if (sysStatus.connectedStatus < 0 || sysStatus.connectedStatus > 1) {
     if (Particle.connected()) sysStatus.connectedStatus = true;
     else sysStatus.connectedStatus = false;
-  } 
+  }
   if (sysStatus.verboseMode < 0 || sysStatus.verboseMode > 1) sysStatus.verboseMode = false;
   if (sysStatus.solarPowerMode < 0 || sysStatus.solarPowerMode >1) sysStatus.solarPowerMode = 0;
   if (sysStatus.lowPowerMode < 0 || sysStatus.lowPowerMode > 1) sysStatus.lowPowerMode = 0;
-  if (sysStatus.lowBatteryMode < 0 || sysStatus.lowBatteryMode > 1) sysStatus.lowBatteryMode = 0; 
+  if (sysStatus.lowBatteryMode < 0 || sysStatus.lowBatteryMode > 1) sysStatus.lowBatteryMode = 0;
   if (sysStatus.stateOfCharge < 30) sysStatus.lowBatteryMode = true;
   else sysStatus.lowBatteryMode = false;
   if (sysStatus.debounce < 0 || sysStatus.debounce > 6000) sysStatus.debounce = 1000;
@@ -642,7 +659,7 @@ int resetCounts(String command)                                       // Resets 
     current.dailyCount = 0;                                           // Reset Daily Count in memory
     current.hourlyCount = 0;                                          // Reset Hourly Count in memory
     sysStatus.resetCount = 0;                                            // If so, store incremented number - watchdog must have done This
-    current.alertCount = 0;                                           // Reset count variables   
+    current.alertCount = 0;                                           // Reset count variables
     current.hourlyCountInFlight = 0;                                  // In the off-chance there is data in flight
     dataInFlight = false;
     currentCountsWriteNeeded = true;                                  // Make sure we write to FRAM back in the main loop
@@ -692,7 +709,7 @@ int sendNow(String command) // Function to force sending data in current hour
 void resetEverything() {                                            // The device is waking up in a new day or is a new install
   current.dailyCount = 0;                              // Reset the counts in FRAM as well
   current.hourlyCount = 0;
-  current.hourlyCountInFlight = 0;                    
+  current.hourlyCountInFlight = 0;
   current.lastCountTime = Time.now();                      // Set the time context to the new day
   sysStatus.resetCount = current.alertCount = 0;           // Reset everything for the day
   currentCountsWriteNeeded=true;
@@ -855,7 +872,7 @@ void dailyCleanup() {                                                 // Called 
   Particle.publish("Daily Cleanup","Running", PRIVATE);               // Make sure this is being run
 
   sysStatus.verboseMode = false;
- 
+
   Particle.syncTime();                                                // Set the clock each day
   waitFor(Particle.syncTimeDone,30000);                               // Wait for up to 30 seconds for the SyncTime to complete
 
@@ -865,7 +882,7 @@ void dailyCleanup() {                                                 // Called 
   systemStatusWriteNeeded=true;
 }
 
-int setDSTOffset(String command) {                                      // This is the number of hours that will be added for Daylight Savings Time 0 (off) - 2 
+int setDSTOffset(String command) {                                      // This is the number of hours that will be added for Daylight Savings Time 0 (off) - 2
   char * pEND;
   char data[256];
   time_t t = Time.now();
@@ -876,7 +893,7 @@ int setDSTOffset(String command) {                                      // This 
   systemStatusWriteNeeded = true;
   snprintf(data, sizeof(data), "DST offset %2.1f",sysStatus.dstOffset);
   waitUntil(meterParticlePublish);
-  if (Time.isValid()) isDSTusa() ? Time.beginDST() : Time.endDST();     // Perform the DST calculation here 
+  if (Time.isValid()) isDSTusa() ? Time.beginDST() : Time.endDST();     // Perform the DST calculation here
   snprintf(currentOffsetStr,sizeof(currentOffsetStr),"%2.1f UTC",(Time.local() - Time.now()) / 3600.0);
   if (Particle.connected()) Particle.publish("Time",data, PRIVATE);
   waitUntil(meterParticlePublish);
@@ -884,7 +901,7 @@ int setDSTOffset(String command) {                                      // This 
   return 1;
 }
 
-bool isDSTusa() { 
+bool isDSTusa() {
   // United States of America Summer Timer calculation (2am Local Time - 2nd Sunday in March/ 1st Sunday in November)
   // Adapted from @ScruffR's code posted here https://community.particle.io/t/daylight-savings-problem/38424/4
   // The code works in from months, days and hours in succession toward the two transitions
@@ -893,7 +910,7 @@ bool isDSTusa() {
   int dayOfWeek = Time.weekday() - 1; // make Sunday 0 .. Saturday 6
 
   // By Month - inside or outside the DST window
-  if (month >= 4 && month <= 10)  
+  if (month >= 4 && month <= 10)
   { // April to October definetly DST
     return true;
   }
@@ -913,13 +930,13 @@ bool isDSTusa() {
   boolean dayStartedAs = (month == 10); // DST in October, in March not
   // on switching Sunday we need to consider the time
   if (secSinceMidnightLocal >= 2*3600)
-  { //  In the US, Daylight Time is based on local time 
+  { //  In the US, Daylight Time is based on local time
     return !dayStartedAs;
   }
   return dayStartedAs;
 }
 
-bool isDSTnz() { 
+bool isDSTnz() {
   // New Zealand Summer Timer calculation (2am Local Time - last Sunday in September/ 1st Sunday in April)
   // Adapted from @ScruffR's code posted here https://community.particle.io/t/daylight-savings-problem/38424/4
   // The code works in from months, days and hours in succession toward the two transitions
@@ -928,7 +945,7 @@ bool isDSTnz() {
   int dayOfWeek = Time.weekday() - 1; // make Sunday 0 .. Saturday 6
 
   // By Month - inside or outside the DST window - 10 out of 12 months with April and Septemper in question
-  if (month >= 10 || month <= 3)  
+  if (month >= 10 || month <= 3)
   { // October to March is definetly DST - 6 months
     return true;
   }
@@ -948,7 +965,7 @@ bool isDSTnz() {
   boolean dayStartedAs = (month == 10); // DST in October, in March not
   // on switching Sunday we need to consider the time
   if (secSinceMidnightLocal >= 2*3600)
-  { //  In the US, Daylight Time is based on local time 
+  { //  In the US, Daylight Time is based on local time
     return !dayStartedAs;
   }
   return dayStartedAs;
