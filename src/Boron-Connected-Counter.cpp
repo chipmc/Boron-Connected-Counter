@@ -28,6 +28,11 @@
 //v2.03 - Rewrote the Ubidots handler, fixed some minor errors, added time offset string
 //v2.04 - Updated the PMIC stuff
 //v2.05 - Fixed bug in main loop - not resetting FRAM write needed flags
+//v2.06 - Moved to deviceOS@1.5.0-rc2 and updated libraries
+//v2.07 - Improved time keeping
+//v2.08 - Sleep 2.0 
+//v3.01 - Added support for battery context and the Ubidots Webhook to report it.
+
 
 // Particle Product definitions
 void setup();
@@ -37,6 +42,7 @@ void sendEvent();
 void UbidotsHandler(const char *event, const char *data);
 void takeMeasurements();
 void getSignalStrength();
+void getBatteryContext();
 int getTemperature();
 void sensorISR();
 void watchdogISR();
@@ -66,11 +72,11 @@ void dailyCleanup();
 int setDSTOffset(String command);
 bool isDSTusa();
 bool isDSTnz();
-#line 27 "/Users/chipmc/Documents/Maker/Particle/Projects/Boron-Connected-Counter/src/Boron-Connected-Counter.ino"
+#line 32 "/Users/chipmc/Documents/Maker/Particle/Projects/Boron-Connected-Counter/src/Boron-Connected-Counter.ino"
 PRODUCT_ID(10864);                                  // Boron Connected Counter Header
-PRODUCT_VERSION(2);
+PRODUCT_VERSION(3);
 #define DSTRULES isDSTusa
-char currentPointRelease[5] ="2.05";
+char currentPointRelease[5] ="3.01";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -124,6 +130,7 @@ SYSTEM_THREAD(ENABLED);                             // Means my code will not be
 STARTUP(System.enableFeature(FEATURE_RESET_INFO));
 FuelGauge batteryMonitor;                           // Prototype for the fuel gauge (included in Particle core library)
 SystemPowerConfiguration conf;                      // Initalize the PMIC class so you can call the Power Management functions below.
+SystemSleepConfiguration config;                    // Initialize new Sleep 2.0 Api
 MCP79410 rtc;                                       // Rickkas MCP79410 libarary
 MB85RC64 fram(Wire, 0);                             // Rickkas' FRAM library
 
@@ -136,7 +143,6 @@ State oldState = INITIALIZATION_STATE;
 // Pin Constants - Boron Carrier Board v1.2a
 const int tmp36Pin =      A4;                       // Simple Analog temperature sensor
 const int wakeUpPin =     D8;                       // This is the Particle Electron WKP pin
-const int deepSleepPin =  D6;                       // Power Cycles the Electron and the Carrier Board
 const int donePin =       D5;                       // Pin the Electron uses to "pet" the watchdog
 const int blueLED =       D7;                       // This LED is on the Electron itself
 const int userSwitch =    D4;                       // User switch with a pull-up resistor
@@ -162,6 +168,7 @@ bool awokeFromNap = false;                          // In low power mode, we can
 volatile bool watchdogFlag;                         // Flag to let us know we need to pet the dog
 bool dataInFlight = false;                          // Tracks if we have sent data but not yet cleared it from counts until we get confirmation
 char SignalString[64];                              // Used to communicate Wireless RSSI and Description
+char batteryContextStr[16];                         // Tracks the battery context
 bool systemStatusWriteNeeded = false;               // Keep track of when we need to write
 bool currentCountsWriteNeeded = false;
 
@@ -179,12 +186,11 @@ void setup()                                        // Note: Disconnected Setup(
     All three of these have some common code - this will go first then we will set a conditional
     to determine which of the three we are in and finish the code
   */
-  pinResetFast(deepSleepPin);                       // Make sure since this pin can turn off the device
   pinMode(wakeUpPin,INPUT);                         // This pin is active HIGH
   pinMode(userSwitch,INPUT);                        // Momentary contact button on board for direct user input
   pinMode(blueLED, OUTPUT);                         // declare the Blue LED Pin as an output
   pinMode(donePin,OUTPUT);                          // Allows us to pet the watchdog
-  pinMode(deepSleepPin,OUTPUT);                     // For a hard reset active HIGH
+
   // Pressure / PIR Module Pin Setup
   pinMode(intPin,INPUT_PULLDOWN);                   // pressure sensor interrupt
   pinMode(disableModule,OUTPUT);                    // Turns on the module when pulled low
@@ -213,6 +219,8 @@ void setup()                                        // Note: Disconnected Setup(
   Particle.variable("Debounce",debounceStr);
   Particle.variable("Alerts",current.alertCount);
   Particle.variable("TimeOffset",currentOffsetStr);
+  Particle.variable("BatteryContext",batteryContextStr);
+
 
   Particle.function("resetFRAM", resetFRAM);                          // These are the functions exposed to the mobile app and console
   Particle.function("resetCounts",resetCounts);
@@ -250,13 +258,14 @@ void setup()                                        // Note: Disconnected Setup(
 
   snprintf(debounceStr,sizeof(debounceStr),"%2.1f sec", (float)sysStatus.debounce/1000.0);
 
+  rtc.setup();                                                        // Start the real time clock
+  rtc.clearAlarm();                                                   // Ensures alarm is still not set from last cycle
+
   Time.setDSTOffset(sysStatus.dstOffset);                              // Set the value from FRAM if in limits
   if (!Time.isValid()) Time.setTime(rtc.getRTCTime());
   DSTRULES() ? Time.beginDST() : Time.endDST();    // Perform the DST calculation here
   Time.zone(sysStatus.timezone);                                       // Set the Time Zone for our device
   snprintf(currentOffsetStr,sizeof(currentOffsetStr),"%2.1f UTC",(Time.local() - Time.now()) / 3600.0);   // Load the offset string
-
-  rtc.setup();                                                        // Start the real time clock
 
   // Done with the System Stuff - now load the current counts
   fram.get(FRAM::currentCountsAddr,current);
@@ -313,7 +322,6 @@ void loop()
       fram.put(FRAM::currentCountsAddr,current);
       currentCountsWriteNeeded = false;
     }
-    systemStatusWriteNeeded = currentCountsWriteNeeded = false;
     if (sysStatus.lowPowerMode && (millis() - stayAwakeTimeStamp) > stayAwake) state = NAPPING_STATE;  // When in low power mode, we can nap between taps
     if (Time.hour() != currentHourlyPeriod) state = REPORTING_STATE;  // We want to report on the hour but not after bedtime
     if ((Time.hour() >= sysStatus.closeTime || Time.hour() < sysStatus.openTime)) state = SLEEPING_STATE;   // The park is closed - sleep
@@ -331,8 +339,7 @@ void loop()
     digitalWrite(blueLED,LOW);                                        // Turn off the LED
     petWatchdog();
     int wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);
-    rtc.setAlarm(wakeInSeconds);                                      // Very deep sleep till the next hour - then resets
-    System.sleep(SLEEP_MODE_SOFTPOWEROFF);                            // Sleeps then the RTC will wake on D8
+    rtc.setAlarm(wakeInSeconds);                                // The Real Time Clock will turn the Enable pin back on to wake the device
     } break;
 
   case NAPPING_STATE: {  // This state puts the device in low power mode quickly
@@ -342,10 +349,15 @@ void loop()
     stayAwake = sysStatus.debounce;                                   // Once we come into this function, we need to reset stayAwake as it changes at the top of the hour
     int wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);
     petWatchdog();                                                    // Reset the watchdog timer interval
-    System.sleep(intPin, RISING, wakeInSeconds);                      // Sensor will wake us with an interrupt or timeout at the hour
+    config.mode(SystemSleepMode::STOP).gpio(userSwitch,CHANGE).gpio(intPin,RISING).duration(wakeInSeconds * 1000).flag(SystemSleepFlag::WAIT_CLOUD);
+    SystemSleepResult result = System.sleep(config);                    // Put the device to sleep
     if (sensorDetect) {                                               // Executions starts here after sleep - time or sensor interrupt?
       awokeFromNap=true;                                              // Since millis() stops when sleeping - need this to debounce
       stayAwakeTimeStamp = millis();
+    }
+    else if (result.wakeupPin()) {
+      sysStatus.lowPowerMode = false;             // User button takes you out of low power mode
+      connectToParticle();
     }
     state = IDLE_STATE;                                               // Back to the IDLE_STATE after a nap - not enabling updates here as napping is typicallly disconnected
     } break;
@@ -396,7 +408,6 @@ void loop()
         delay(2000);
         sysStatus.resetCount = 0;                                  // Zero the ResetCount
         systemStatusWriteNeeded=true;
-        digitalWrite(deepSleepPin,HIGH);                              // This will cut all power to the Boron AND everything it powers
         rtc.setAlarm(10);
       }
       else {                                                          // If we have had 3 resets - time to do something more
@@ -446,8 +457,6 @@ void recordCount() // This is where we check to see if an interrupt is set when 
     Particle.publish("Event","Debounced", PRIVATE);
   }
 
-  if (!digitalRead(userSwitch)) loadSystemDefaults();                 // A low value means someone is pushing this button - will trigger a send to Ubidots and take out of low power mode
-
   currentCountsWriteNeeded = true;                                    // Write updated values to FRAM
   pinResetFast(blueLED);                                              // Turn off the blue LED
   sensorDetect = false;                                               // Reset the flag
@@ -456,8 +465,8 @@ void recordCount() // This is where we check to see if an interrupt is set when 
 
 void sendEvent() {
   char data[256];                                                     // Store the date in this character array - not global
-  snprintf(data, sizeof(data), "{\"hourly\":%i, \"daily\":%i,\"battery\":%i, \"temp\":%i, \"resets\":%i, \"alerts\":%i, \"maxmin\":%i}",current.hourlyCount, current.dailyCount, sysStatus.stateOfCharge, current.temperature, sysStatus.resetCount, current.alertCount, current.maxMinValue);
-  Particle.publish("Ubidots-Car-Hook", data, PRIVATE);
+  snprintf(data, sizeof(data), "{\"hourly\":%i, \"daily\":%i,\"battery\":%i,  \"key1\":\"%s\", \"temp\":%i, \"resets\":%i, \"alerts\":%i, \"maxmin\":%i}",current.hourlyCount, current.dailyCount, sysStatus.stateOfCharge, batteryContextStr, current.temperature, sysStatus.resetCount, current.alertCount, current.maxMinValue);
+  Particle.publish("Ubidots-Counter-Hook-v1", data, PRIVATE);
   dataInFlight = true;                                                // set the data inflight flag
   webhookTimeStamp = millis();
   currentHourlyPeriod = Time.hour();
@@ -488,13 +497,13 @@ void takeMeasurements()
 {
   if (Cellular.ready()) getSignalStrength();                          // Test signal strength if the cellular modem is on and ready
   getTemperature();                                                   // Get Temperature at startup as well
-  sysStatus.stateOfCharge = int(batteryMonitor.getSoC());             // Percentage of full charge
+  getBatteryContext();                                                // What is the battery up to?
+  sysStatus.stateOfCharge = int(System.batteryCharge());             // Percentage of full charge
   systemStatusWriteNeeded=true;
 }
 
 
-void getSignalStrength()
-{
+void getSignalStrength() {
   const char* radioTech[10] = {"Unknown","None","WiFi","GSM","UMTS","CDMA","LTE","IEEE802154","LTE_CAT_M1","LTE_CAT_NB1"};
   // New Signal Strength capability - https://community.particle.io/t/boron-lte-and-cellular-rssi-funny-values/45299/8
   CellularSignal sig = Cellular.RSSI();
@@ -508,6 +517,14 @@ void getSignalStrength()
   float qualityPercentage = sig.getQuality();
 
   snprintf(SignalString,sizeof(SignalString), "%s S:%2.0f%%, Q:%2.0f%% ", radioTech[rat], strengthPercentage, qualityPercentage);
+}
+
+void getBatteryContext() {
+  const char* batteryContext[7] ={"Unknown","Not Charging","Charging","Charged","Discharging","Fault","Diconnected"};
+  // Battery conect information - https://docs.particle.io/reference/device-os/firmware/boron/#batterystate-
+
+  snprintf(batteryContextStr, sizeof(batteryContextStr),"%s", batteryContext[System.batteryState()]);
+
 }
 
 int getTemperature()
@@ -674,7 +691,6 @@ int hardResetNow(String command)                                      // Will pe
   if (command == "1")
   {
     Particle.publish("Reset","Hard Reset in 2 seconds",PRIVATE);
-    digitalWrite(deepSleepPin,HIGH);                              // This will cut all power to the Boron AND everything it powers
     rtc.setAlarm(10);
     return 1;                                                         // Unfortunately, this will never be sent
   }
@@ -764,7 +780,8 @@ int setTimeZone(String command)
 {
   char * pEND;
   char data[256];
-  time_t t = Time.now();
+  Particle.syncTime();                                                        // Set the clock each day
+  waitFor(Particle.syncTimeDone,30000);                                       // Wait for up to 30 seconds for the SyncTime to complete
   int8_t tempTimeZoneOffset = strtol(command,&pEND,10);                       // Looks for the first integer and interprets it
   if ((tempTimeZoneOffset < -12) | (tempTimeZoneOffset > 12)) return 0;       // Make sure it falls in a valid range or send a "fail" result
   sysStatus.timezone = (float)tempTimeZoneOffset;
@@ -775,7 +792,7 @@ int setTimeZone(String command)
   waitUntil(meterParticlePublish);
   if (Particle.connected()) Particle.publish("Time",data, PRIVATE);
   waitUntil(meterParticlePublish);
-  if (Particle.connected()) Particle.publish("Time",Time.timeStr(t), PRIVATE);
+  if (Particle.connected()) Particle.publish("Time",Time.timeStr(Time.now()), PRIVATE);
   return 1;
 }
 
