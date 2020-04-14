@@ -24,7 +24,7 @@
 //v2.05 - Fixed bug in main loop - not resetting FRAM write needed flags
 //v2.06 - Moved to deviceOS@1.5.0-rc2 and updated libraries
 //v2.07 - Improved time keeping
-//v2.08 - Sleep 2.0 
+//v2.08 - Sleep 2.0
 //v3.01 - Added support for battery context and the Ubidots Webhook to report it.
 
 
@@ -125,6 +125,7 @@ volatile bool watchdogFlag;                         // Flag to let us know we ne
 bool dataInFlight = false;                          // Tracks if we have sent data but not yet cleared it from counts until we get confirmation
 char SignalString[64];                              // Used to communicate Wireless RSSI and Description
 char batteryContextStr[16];                         // Tracks the battery context
+char lowPowerModeStr[6];                            // In low power mode?
 bool systemStatusWriteNeeded = false;               // Keep track of when we need to write
 bool currentCountsWriteNeeded = false;
 
@@ -169,7 +170,7 @@ void setup()                                        // Note: Disconnected Setup(
   Particle.variable("Temperature",current.temperature);
   Particle.variable("Release",currentPointRelease);
   Particle.variable("stateOfChg", sysStatus.stateOfCharge);
-  Particle.variable("lowPowerMode",(bool)sysStatus.lowPowerMode);
+  Particle.variable("lowPowerMode",lowPowerModeStr);
   Particle.variable("OpenTime",sysStatus.openTime);
   Particle.variable("CloseTime",sysStatus.closeTime);
   Particle.variable("Debounce",debounceStr);
@@ -307,14 +308,11 @@ void loop()
     petWatchdog();                                                    // Reset the watchdog timer interval
     config.mode(SystemSleepMode::STOP).gpio(userSwitch,CHANGE).gpio(intPin,RISING).duration(wakeInSeconds * 1000).flag(SystemSleepFlag::WAIT_CLOUD);
     SystemSleepResult result = System.sleep(config);                    // Put the device to sleep
-    if (sensorDetect) {                                               // Executions starts here after sleep - time or sensor interrupt?
+    if (result.wakeupPin() == intPin) {                                               // Executions starts here after sleep - time or sensor interrupt?
       awokeFromNap=true;                                              // Since millis() stops when sleeping - need this to debounce
       stayAwakeTimeStamp = millis();
     }
-    else if (result.wakeupPin()) {
-      sysStatus.lowPowerMode = false;             // User button takes you out of low power mode
-      connectToParticle();
-    }
+    else if (result.wakeupPin() == userSwitch) setLowPowerMode("0");
     state = IDLE_STATE;                                               // Back to the IDLE_STATE after a nap - not enabling updates here as napping is typicallly disconnected
     } break;
 
@@ -544,7 +542,7 @@ void loadSystemDefaults() {                                         // Default s
   sysStatus.verboseMode = true;
   if (sysStatus.stateOfCharge < 30) sysStatus.lowBatteryMode = true;
   else sysStatus.lowBatteryMode = false;
-  sysStatus.lowPowerMode = false;
+  setLowPowerMode("0");
   sysStatus.debounce = 1000;
   sysStatus.timezone = -5;                                          // Default is East Coast Time
   sysStatus.dstOffset = 1;
@@ -563,7 +561,7 @@ void checkSystemValues() {                                          // Checks to
   }
   if (sysStatus.verboseMode < 0 || sysStatus.verboseMode > 1) sysStatus.verboseMode = false;
   if (sysStatus.solarPowerMode < 0 || sysStatus.solarPowerMode >1) sysStatus.solarPowerMode = 0;
-  if (sysStatus.lowPowerMode < 0 || sysStatus.lowPowerMode > 1) sysStatus.lowPowerMode = 0;
+  if (sysStatus.lowPowerMode < 0 || sysStatus.lowPowerMode > 1) setLowPowerMode("1");
   if (sysStatus.lowBatteryMode < 0 || sysStatus.lowBatteryMode > 1) sysStatus.lowBatteryMode = 0;
   if (sysStatus.stateOfCharge < 30) sysStatus.lowBatteryMode = true;
   else sysStatus.lowBatteryMode = false;
@@ -780,25 +778,29 @@ int setCloseTime(String command)
   return 1;
 }
 
-
 int setLowPowerMode(String command)                                   // This is where we can put the device into low power mode if needed
 {
   if (command != "1" && command != "0") return 0;                     // Before we begin, let's make sure we have a valid input
   if (command == "1")                                                 // Command calls for setting lowPowerMode
   {
-    if (sysStatus.verboseMode && Particle.connected()) {
+    if (Particle.connected()) {
       waitUntil(meterParticlePublish);
-      Particle.publish("Mode","Low Power", PRIVATE);
+      Particle.publish("Mode","Low Power Mode", PRIVATE);
     }
     sysStatus.lowPowerMode = true;
+    strcpy(lowPowerModeStr,"True");
   }
   else if (command == "0")                                            // Command calls for clearing lowPowerMode
   {
-    if (sysStatus.verboseMode && Particle.connected()) {
-      waitUntil(meterParticlePublish);
-      Particle.publish("Mode","Normal Operations", PRIVATE);
+    if (!Particle.connected()) {                                      // In case we are not connected, we will do so now.
+      connectToParticle();
+      sysStatus.connectedStatus = true;
     }
-    sysStatus.lowPowerMode = false;
+    waitUntil(meterParticlePublish);
+    Particle.publish("Mode","Normal Operations", PRIVATE);
+    delay(1000);                                                      // Need to make sure the message gets out.
+    sysStatus.lowPowerMode = false;                                   // update the variable used for console status
+    strcpy(lowPowerModeStr,"False");                                  // Use capitalization so we know that we set this.
   }
   systemStatusWriteNeeded = true;
   return 1;
@@ -850,7 +852,7 @@ void dailyCleanup() {                                                 // Called 
   waitFor(Particle.syncTimeDone,30000);                               // Wait for up to 30 seconds for the SyncTime to complete
 
   if (sysStatus.solarPowerMode || sysStatus.stateOfCharge <= 70) {    // If Solar or if the battery is being discharged
-    sysStatus.lowPowerMode = true;
+    setLowPowerMode("1");
   }
   systemStatusWriteNeeded=true;
 }
