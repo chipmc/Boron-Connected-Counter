@@ -26,13 +26,27 @@
 //v2.07 - Improved time keeping
 //v2.08 - Sleep 2.0
 //v3.01 - Added support for battery context and the Ubidots Webhook to report it.
+//v3.02 - Issue which prevents charging.
+//v3.03 - Trying to revert to PMIC for Solar
+//v3.10 - Updated the power management function to move back to the new setPowerConfiguration Api
 
+/*
+STARTUP( reEnableCharging());
+
+void reEnableCharging() {
+  SystemPowerConfiguration conf;
+  PMIC pmic;
+  conf.feature(SystemPowerFeature::DISABLE);
+  System.setPowerConfiguration(conf);
+  pmic.enableCharging();
+};
+*/
 
 // Particle Product definitions
 PRODUCT_ID(10864);                                  // Boron Connected Counter Header
 PRODUCT_VERSION(3);
 #define DSTRULES isDSTusa
-char currentPointRelease[5] ="3.01";
+char currentPointRelease[5] ="3.10";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -84,8 +98,6 @@ struct currentCounts_structure {                    // currently 10 bytes long
 SYSTEM_MODE(SEMI_AUTOMATIC);                        // This will enable user code to start executing automatically.
 SYSTEM_THREAD(ENABLED);                             // Means my code will not be held up by Particle processes.
 STARTUP(System.enableFeature(FEATURE_RESET_INFO));
-FuelGauge batteryMonitor;                           // Prototype for the fuel gauge (included in Particle core library)
-SystemPowerConfiguration conf;                      // Initalize the PMIC class so you can call the Power Management functions below.
 SystemSleepConfiguration config;                    // Initialize new Sleep 2.0 Api
 MCP79410 rtc;                                       // Rickkas MCP79410 libarary
 MB85RC64 fram(Wire, 0);                             // Rickkas' FRAM library
@@ -155,6 +167,8 @@ void setup()                                        // Note: Disconnected Setup(
   pinMode(ledPower,OUTPUT);                         // Turn on the lights
   pinSetFast(ledPower);                             // Turns on the LED on the pressure sensor board
 
+  digitalWrite(blueLED,HIGH);
+
   petWatchdog();                                    // Pet the watchdog - This will reset the watchdog time period
   attachInterrupt(wakeUpPin, watchdogISR, RISING);  // The watchdog timer will signal us and we have to respond
 
@@ -215,6 +229,8 @@ void setup()                                        // Note: Disconnected Setup(
 
   snprintf(debounceStr,sizeof(debounceStr),"%2.1f sec", (float)sysStatus.debounce/1000.0);
 
+  (sysStatus.lowPowerMode) ? strcpy(lowPowerModeStr,"True") : strcpy(lowPowerModeStr,"False");
+
   rtc.setup();                                                        // Start the real time clock
   rtc.clearAlarm();                                                   // Ensures alarm is still not set from last cycle
 
@@ -229,15 +245,13 @@ void setup()                                        // Note: Disconnected Setup(
   if (current.hourlyCount) currentHourlyPeriod = Time.hour(current.lastCountTime);
   else currentHourlyPeriod = Time.hour();                              // The local time hourly period for reporting purposes
 
-  Serial.println(Time.timeStr(rtc.getRTCTime()));  // ******* - Debug code
-  Serial.println(Time.timeStr(Time.local()));
-
-  PMICreset();                                                        // Executes commands that set up the PMIC for Solar charging
+  setPowerConfig();                                                    // Executes commands that set up the Power configuration between Solar and DC-Powered
 
   if (!digitalRead(userSwitch)) loadSystemDefaults();                 // Make sure the device wakes up and connects
 
   // Here is where the code diverges based on why we are running Setup()
   // Deterimine when the last counts were taken check when starting test to determine if we reload values or start counts over
+  
   if (Time.day() != Time.day(current.lastCountTime)) {    // ******  - These are debug lines
     resetEverything();                                               // Zero the counts for the new day
     if (sysStatus.solarPowerMode && !sysStatus.lowPowerMode) {
@@ -256,6 +270,8 @@ void setup()                                        // Note: Disconnected Setup(
   pinResetFast(ledPower);                                             // Turns off the LED on the sensor board
 
   if (state == INITIALIZATION_STATE) state = IDLE_STATE;              // IDLE unless otherwise from above code
+
+   digitalWrite(blueLED,LOW);
 }
 
 void loop()
@@ -452,6 +468,7 @@ void takeMeasurements()
   if (Cellular.ready()) getSignalStrength();                          // Test signal strength if the cellular modem is on and ready
   getTemperature();                                                   // Get Temperature at startup as well
   getBatteryContext();                                                // What is the battery up to?
+  //sysStatus.stateOfCharge = int(batteryMonitor.getSoC());
   sysStatus.stateOfCharge = int(System.batteryCharge());             // Percentage of full charge
   systemStatusWriteNeeded=true;
 }
@@ -510,25 +527,32 @@ void petWatchdog()
   watchdogFlag = false;
 }
 
+
 // Power Management function
-void PMICreset() {
+int setPowerConfig() {
+  SystemPowerConfiguration conf;
+  System.setPowerConfiguration(SystemPowerConfiguration());  // To restore the default configuration
+
   if (sysStatus.solarPowerMode) {
-    conf.powerSourceMaxCurrent(900)                                  // default is 900mA
-    .powerSourceMinVoltage(5080)                                     // Set the lowest input voltage to 5.080 volts best setting for 6V solar panels
-    .batteryChargeCurrent(1024)                                      // default is 512mA matches my 3W panel
-    .batteryChargeVoltage(4208)                                      // Allows us to charge cloe to 100% - battery can't go over 45 celcius
-    .feature(SystemPowerFeature::PMIC_DETECTION)
-    .feature(SystemPowerFeature::USE_VIN_SETTINGS_WITH_USB_HOST) ;
-    System.setPowerConfiguration(conf);
+    conf.powerSourceMaxCurrent(550) // Set maximum current the power source can provide (applies only when powered through VIN)
+        .powerSourceMinVoltage(5080) // Set minimum voltage the power source can provide (applies only when powered through VIN)
+        .batteryChargeCurrent(512) // Set battery charge current
+        .batteryChargeVoltage(4210) // Set battery termination voltage
+        .feature(SystemPowerFeature::USE_VIN_SETTINGS_WITH_USB_HOST); // For the cases where the device is powered through VIN
+                                                                     // but the USB cable is connected to a USB host, this feature flag
+                                                                     // enforces the voltage/current limits specified in the configuration
+                                                                     // (where by default the device would be thinking that it's powered by the USB Host)
+    int res = System.setPowerConfiguration(conf); // returns SYSTEM_ERROR_NONE (0) in case of success
+    return res;
   }
   else  {
-    conf.powerSourceMaxCurrent(1500)                                 // default is 900mA this let's me charge faster
-    .powerSourceMinVoltage(4208)                                     // This is the default value for the Boron
-    .batteryChargeCurrent(1024)                                      // default is 2048mA (011000) = 512mA+1024mA+512mA)
-    .batteryChargeVoltage(4112)                                      // default is 4.112V termination voltage
-    .feature(SystemPowerFeature::PMIC_DETECTION)
-    .feature(SystemPowerFeature::USE_VIN_SETTINGS_WITH_USB_HOST) ;
-    System.setPowerConfiguration(conf);
+    conf.powerSourceMaxCurrent(900)                                   // default is 900mA 
+        .powerSourceMinVoltage(4208)                                     // This is the default value for the Boron
+        .batteryChargeCurrent(1024)                                      // higher charge current from DC-IN when not solar powered
+        .batteryChargeVoltage(4112)                                      // default is 4.112V termination voltage
+        .feature(SystemPowerFeature::USE_VIN_SETTINGS_WITH_USB_HOST) ;
+    int res = System.setPowerConfiguration(conf); // returns SYSTEM_ERROR_NONE (0) in case of success
+    return res;
   }
 }
 
@@ -691,7 +715,7 @@ int setSolarMode(String command) // Function to force sending data in current ho
   if (command == "1")
   {
     sysStatus.solarPowerMode = true;
-    PMICreset();                                               // Change the power management Settings
+    setPowerConfig();                                               // Change the power management Settings
     systemStatusWriteNeeded=true;
     waitUntil(meterParticlePublish);
     if (Particle.connected()) Particle.publish("Mode","Set Solar Powered Mode", PRIVATE);
@@ -701,7 +725,7 @@ int setSolarMode(String command) // Function to force sending data in current ho
   {
     sysStatus.solarPowerMode = false;
     systemStatusWriteNeeded=true;
-    PMICreset();                                                // Change the power management settings
+    setPowerConfig();                                                // Change the power management settings
     waitUntil(meterParticlePublish);
     if (Particle.connected()) Particle.publish("Mode","Cleared Solar Powered Mode", PRIVATE);
     return 1;
