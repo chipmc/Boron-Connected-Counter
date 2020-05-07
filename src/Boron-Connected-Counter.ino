@@ -29,6 +29,7 @@
 //v3.02 - Issue which prevents charging.
 //v3.03 - Trying to revert to PMIC for Solar
 //v3.10 - Updated the power management function to move back to the new setPowerConfiguration Api
+//v3.11 - Minor fix to charge current for the non-solar use case
 
 /*
 STARTUP( reEnableCharging());
@@ -547,9 +548,9 @@ int setPowerConfig() {
   }
   else  {
     conf.powerSourceMaxCurrent(900)                                   // default is 900mA 
-        .powerSourceMinVoltage(4208)                                     // This is the default value for the Boron
-        .batteryChargeCurrent(1024)                                      // higher charge current from DC-IN when not solar powered
-        .batteryChargeVoltage(4112)                                      // default is 4.112V termination voltage
+        .powerSourceMinVoltage(4208)                                  // This is the default value for the Boron
+        .batteryChargeCurrent(900)                                    // higher charge current from DC-IN when not solar powered
+        .batteryChargeVoltage(4112)                                   // default is 4.112V termination voltage
         .feature(SystemPowerFeature::USE_VIN_SETTINGS_WITH_USB_HOST) ;
     int res = System.setPowerConfiguration(conf); // returns SYSTEM_ERROR_NONE (0) in case of success
     return res;
