@@ -34,18 +34,12 @@
 //v3.01 - Added support for battery context and the Ubidots Webhook to report it.
 //v3.02 - Issue which prevents charging.
 //v3.03 - Trying to revert to PMIC for Solar
+//v3.10 - Updated the power management function to move back to the new setPowerConfiguration Api
+//v3.11 - Minor fix to charge current for the non-solar use case
+//v3.12 - Trying a lower value for solar charge 4208
+//v3.13 - Added instructions to explicitly tell the device to charge
+//v3.14 - Added debugging code
 
-/*
-STARTUP( reEnableCharging());
-
-void reEnableCharging() {
-  SystemPowerConfiguration conf;
-  PMIC pmic;
-  conf.feature(SystemPowerFeature::DISABLE);
-  System.setPowerConfiguration(conf);
-  pmic.enableCharging();
-};
-*/
 
 // Particle Product definitions
 void setup();
@@ -61,6 +55,7 @@ void sensorISR();
 void watchdogISR();
 void petWatchdog();
 int setPowerConfig();
+bool enableCharging(bool enableCharge);
 void loadSystemDefaults();
 void checkSystemValues();
 bool connectToParticle();
@@ -85,11 +80,11 @@ void dailyCleanup();
 int setDSTOffset(String command);
 bool isDSTusa();
 bool isDSTnz();
-#line 45 "/Users/chipmc/Documents/Maker/Particle/Projects/Boron-Connected-Counter/src/Boron-Connected-Counter.ino"
+#line 39 "/Users/chipmc/Documents/Maker/Particle/Projects/Boron-Connected-Counter/src/Boron-Connected-Counter.ino"
 PRODUCT_ID(10864);                                  // Boron Connected Counter Header
 PRODUCT_VERSION(3);
 #define DSTRULES isDSTusa
-char currentPointRelease[5] ="3.03";
+char currentPointRelease[5] ="3.13";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -144,6 +139,7 @@ STARTUP(System.enableFeature(FEATURE_RESET_INFO));
 SystemSleepConfiguration config;                    // Initialize new Sleep 2.0 Api
 MCP79410 rtc;                                       // Rickkas MCP79410 libarary
 MB85RC64 fram(Wire, 0);                             // Rickkas' FRAM library
+Serial1LogHandler debugOutput(57600);
 
 // State Maching Variables
 enum State { INITIALIZATION_STATE, ERROR_STATE, IDLE_STATE, SLEEPING_STATE, NAPPING_STATE, REPORTING_STATE, RESP_WAIT_STATE };
@@ -288,7 +284,7 @@ void setup()                                        // Note: Disconnected Setup(
   if (current.hourlyCount) currentHourlyPeriod = Time.hour(current.lastCountTime);
   else currentHourlyPeriod = Time.hour();                              // The local time hourly period for reporting purposes
 
-  setPowerConfig();                                                        // Executes commands that set up the PMIC for Solar charging
+  setPowerConfig();                                                    // Executes commands that set up the Power configuration between Solar and DC-Powered
 
   if (!digitalRead(userSwitch)) loadSystemDefaults();                 // Make sure the device wakes up and connects
 
@@ -436,6 +432,32 @@ void loop()
   }
   rtc.loop();                                                         // keeps the clock up to date
   //sensorDetect = steadyCountTest();                                     // Comment out to cause the device to run through a series of tests
+  waitUntil(meterParticlePublish);
+  PMIC power(true);
+  Log.trace("Current PMIC settings:");
+  Log.trace("VIN Vmin: %u", power.getInputVoltageLimit());
+  Log.trace("VIN Imax: %u", power.getInputCurrentLimit());
+  Log.trace("Ichg: %u", power.getChargeCurrentValue());
+  Log.trace("Iterm: %u", power.getChargeVoltageValue());
+  Log.trace("Iterm: %u", power.getFault());
+  Log.trace("Iterm: %u", power.getSystemStatus());
+  Log.trace("Iterm: %u", power.readOpControlRegister());
+  int powerSource = System.powerSource();
+  int batteryState = System.batteryState();
+  float batterySoc = System.batteryCharge();
+  constexpr char const* batteryStates[] = {
+      "unknown", "not charging", "charging",
+      "charged", "discharging", "fault", "disconnected"
+  };
+  constexpr char const* powerSources[] = {
+      "unknown", "vin", "usb host", "usb adapter",
+      "usb otg", "battery"
+  };
+  Log.trace("Power source: %s", powerSources[std::max(0, powerSource)]);
+  Log.trace("Battery state: %s", batteryStates[std::max(0, batteryState)]);
+  Log.trace("Battery charge: %f", batterySoc);
+
+
 }
 
 void recordCount() // This is where we check to see if an interrupt is set when not asleep or act on a tap that woke the Arduino
@@ -578,7 +600,7 @@ int setPowerConfig() {
 
   if (sysStatus.solarPowerMode) {
     conf.powerSourceMaxCurrent(550) // Set maximum current the power source can provide (applies only when powered through VIN)
-        .powerSourceMinVoltage(5080) // Set minimum voltage the power source can provide (applies only when powered through VIN)
+        .powerSourceMinVoltage(4208) // ** was 5080 *** Set minimum voltage the power source can provide (applies only when powered through VIN)
         .batteryChargeCurrent(512) // Set battery charge current
         .batteryChargeVoltage(4210) // Set battery termination voltage
         .feature(SystemPowerFeature::USE_VIN_SETTINGS_WITH_USB_HOST); // For the cases where the device is powered through VIN
@@ -586,16 +608,31 @@ int setPowerConfig() {
                                                                      // enforces the voltage/current limits specified in the configuration
                                                                      // (where by default the device would be thinking that it's powered by the USB Host)
     int res = System.setPowerConfiguration(conf); // returns SYSTEM_ERROR_NONE (0) in case of success
+    enableCharging(true);
     return res;
   }
   else  {
     conf.powerSourceMaxCurrent(900)                                   // default is 900mA 
-        .powerSourceMinVoltage(4208)                                     // This is the default value for the Boron
-        .batteryChargeCurrent(1024)                                      // higher charge current from DC-IN when not solar powered
-        .batteryChargeVoltage(4112)                                      // default is 4.112V termination voltage
+        .powerSourceMinVoltage(4208)                                  // This is the default value for the Boron
+        .batteryChargeCurrent(900)                                    // higher charge current from DC-IN when not solar powered
+        .batteryChargeVoltage(4112)                                   // default is 4.112V termination voltage
         .feature(SystemPowerFeature::USE_VIN_SETTINGS_WITH_USB_HOST) ;
     int res = System.setPowerConfiguration(conf); // returns SYSTEM_ERROR_NONE (0) in case of success
+    enableCharging(true);
     return res;
+  }
+}
+
+bool enableCharging(bool enableCharge)
+{
+  PMIC pmic(true);
+  if(enableCharge) {
+    pmic.enableCharging();
+    return TRUE;
+  }
+  else {
+    pmic.disableCharging();
+    return FALSE;
   }
 }
 
