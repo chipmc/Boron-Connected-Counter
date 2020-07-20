@@ -36,13 +36,15 @@
 //v4.00 - Fixed issue where counts are not zeroed if the device does not sleep at night (zero counts at mighnight skipped reset)
 //v5.00 - Took out debugging code
 //v5.01 - Added code to put timestamp on hourly events, Moved to 2nd Tire Counting
-//v5.02 - Moved to the Async Particle Publish Library
+//v6.00 - Moved to the Async Particle Publish Library
+//v7.00 - Added PMIC.enableBuck() to Setup: https://community.particle.io/t/battery-charge-doesnt-work-if-starting-when-en-grounded/56082/19
+//v8.00 - Updated the Power Config settings to improve charging efficiency.
 
 // Particle Product definitions
 PRODUCT_ID(10864);                                  // Boron Connected Counter Header
-PRODUCT_VERSION(5);
+PRODUCT_VERSION(8);
 #define DSTRULES isDSTusa
-char currentPointRelease[5] ="5.02";
+char currentPointRelease[5] ="8";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -99,8 +101,7 @@ MCP79410 rtc;                                       // Rickkas MCP79410 libarary
 MB85RC64 fram(Wire, 0);                             // Rickkas' FRAM library
 retained uint8_t publishQueueRetainedBuffer[2048];
 PublishQueueAsync publishQueue(publishQueueRetainedBuffer, sizeof(publishQueueRetainedBuffer));
-
-
+PMIC pmic;
 
 // State Maching Variables
 enum State { INITIALIZATION_STATE, ERROR_STATE, IDLE_STATE, SLEEPING_STATE, NAPPING_STATE, REPORTING_STATE, RESP_WAIT_STATE };
@@ -142,7 +143,6 @@ bool currentCountsWriteNeeded = false;
 
 // This section is where we will initialize sensor specific variables, libraries and function prototypes
 // Pressure Sensor Variables
-char debounceStr[8] = "NA";                         // String to make debounce more readable on the mobile app
 volatile bool sensorDetect = false;                 // This is the flag that an interrupt is triggered
 
 void setup()                                        // Note: Disconnected Setup()
@@ -202,6 +202,8 @@ void setup()                                        // Note: Disconnected Setup(
   Particle.function("Set-DSTOffset",setDSTOffset);
   Particle.function("Set-OpenTime",setOpenTime);
   Particle.function("Set-Close",setCloseTime);
+
+  pmic.enableBuck();                                                  // To enable charging 
 
   // Load FRAM and reset variables to their correct values
   fram.begin();                                                       // Initialize the FRAM module
@@ -520,12 +522,11 @@ void petWatchdog()
 int setPowerConfig() {
   SystemPowerConfiguration conf;
   System.setPowerConfiguration(SystemPowerConfiguration());  // To restore the default configuration
-
   if (sysStatus.solarPowerMode) {
-    conf.powerSourceMaxCurrent(550) // Set maximum current the power source can provide (applies only when powered through VIN)
-        .powerSourceMinVoltage(4208) // ** was 5080 *** Set minimum voltage the power source can provide (applies only when powered through VIN)
-        .batteryChargeCurrent(512) // Set battery charge current
-        .batteryChargeVoltage(4210) // Set battery termination voltage
+    conf.powerSourceMaxCurrent(900) // Set maximum current the power source can provide (applies only when powered through VIN)
+        .powerSourceMinVoltage(5080) // Set minimum voltage the power source can provide (applies only when powered through VIN)
+        .batteryChargeCurrent(1024) // Set battery charge current
+        .batteryChargeVoltage(4208) // Set battery termination voltage
         .feature(SystemPowerFeature::USE_VIN_SETTINGS_WITH_USB_HOST); // For the cases where the device is powered through VIN
                                                                      // but the USB cable is connected to a USB host, this feature flag
                                                                      // enforces the voltage/current limits specified in the configuration
