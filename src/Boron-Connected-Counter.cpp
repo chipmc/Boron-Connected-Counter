@@ -45,6 +45,7 @@
 //v6.00 - Moved to the Async Particle Publish Library
 //v7.00 - Added PMIC.enableBuck() to Setup: https://community.particle.io/t/battery-charge-doesnt-work-if-starting-when-en-grounded/56082/19
 //v8.00 - Updated the Power Config settings to improve charging efficiency.
+//v9.00 - Added ability to select sensor and behaviour
 
 // Particle Product definitions
 void setup();
@@ -72,6 +73,7 @@ int hardResetNow(String command);
 int sendNow(String command);
 void resetEverything();
 int setSolarMode(String command);
+int setSensorType(String command);
 int setverboseMode(String command);
 int setTimeZone(String command);
 int setOpenTime(String command);
@@ -83,11 +85,11 @@ void dailyCleanup();
 int setDSTOffset(String command);
 bool isDSTusa();
 bool isDSTnz();
-#line 44 "/Users/chipmc/Documents/Maker/Particle/Projects/Boron-Connected-Counter/src/Boron-Connected-Counter.ino"
+#line 45 "/Users/chipmc/Documents/Maker/Particle/Projects/Boron-Connected-Counter/src/Boron-Connected-Counter.ino"
 PRODUCT_ID(10864);                                  // Boron Connected Counter Header
-PRODUCT_VERSION(8);
+PRODUCT_VERSION(10);
 #define DSTRULES isDSTusa
-char currentPointRelease[5] ="8";
+char currentPointRelease[5] ="10";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -116,6 +118,7 @@ struct systemStatus_structure {                     // currently 14 bytes long
   int openTime;                                     // Hour the park opens (0-23)
   int closeTime;                                    // Hour the park closes (0-23)
   unsigned long lastHookResponse;                   // Last time we got a valid Webhook response
+  uint8_t sensorType;                               // What is the sensor type - 0-Pressure Sensor, 1-PIR Sensor, 2-Legacy Pressure Senssor
 } sysStatus;
 
 struct currentCounts_structure {                    // currently 10 bytes long
@@ -128,12 +131,17 @@ struct currentCounts_structure {                    // currently 10 bytes long
   int maxMinValue;                                  // Highest count in one minute in the current period
 } current;
 
+// Atomic vairables - values are set and get atomically for use with ISR
+std::atomic<uint32_t> hourlyAtomic;
+std::atomic<uint32_t> dailyAtomic;
+
 // Included Libraries
 #include "3rdGenDevicePinoutdoc.h"                  // Pinout Documentation File
 #include "MCP79410RK.h"                             // Real Time Clock
 #include "MB85RC256V-FRAM-RK.h"                     // Rickkas Particle based FRAM Library
 #include "UnitTestCode.h"                           // This code will exercise the device
 #include "PublishQueueAsyncRK.h"                    // Async Particle Publish
+#include <atomic>
 
 // Prototypes and System Mode calls
 SYSTEM_MODE(SEMI_AUTOMATIC);                        // This will enable user code to start executing automatically.
@@ -174,6 +182,7 @@ unsigned long webhookTimeStamp = 0;                 // Webhooks...
 unsigned long resetTimeStamp = 0;                   // Resets - this keeps you from falling into a reset loop
 char currentOffsetStr[10];                          // What is our offset from UTC
 int currentHourlyPeriod = 0;                        // Need to keep this separate from time so we know when to report
+char sensorTypeConfigStr[16];
 
 // Program Variables
 volatile bool watchdogFlag;                         // Flag to let us know we need to pet the dog
@@ -232,6 +241,7 @@ void setup()                                        // Note: Disconnected Setup(
   Particle.variable("Alerts",current.alertCount);
   Particle.variable("TimeOffset",currentOffsetStr);
   Particle.variable("BatteryContext",batteryContextStr);
+  Particle.variable("SensorStatus",sensorTypeConfigStr);
 
 
   Particle.function("resetFRAM", resetFRAM);                          // These are the functions exposed to the mobile app and console
@@ -245,6 +255,7 @@ void setup()                                        // Note: Disconnected Setup(
   Particle.function("Set-DSTOffset",setDSTOffset);
   Particle.function("Set-OpenTime",setOpenTime);
   Particle.function("Set-Close",setCloseTime);
+  Particle.function("Set-SensorType",setSensorType);
 
   pmic.enableBuck();                                                  // To enable charging 
 
@@ -270,6 +281,10 @@ void setup()                                        // Note: Disconnected Setup(
   }
 
   (sysStatus.lowPowerMode) ? strcpy(lowPowerModeStr,"True") : strcpy(lowPowerModeStr,"False");
+
+  if (sysStatus.sensorType == 0) strcpy(sensorTypeConfigStr,"Pressure Sensor");
+  else if (sysStatus.sensorType == 1) strcpy(sensorTypeConfigStr,"PIR Sensor");
+  else strcpy(sensorTypeConfigStr,"Legacy Sensor");
 
   rtc.setup();                                                        // Start the real time clock
   rtc.clearAlarm();                                                   // Ensures alarm is still not set from last cycle
@@ -541,9 +556,20 @@ int getTemperature()
 void sensorISR()
 {
   static bool frontTireFlag = false;
-  if (frontTireFlag) {
-    sensorDetect = true;                              // sets the sensor flag for the main loop
+  if (frontTireFlag || sysStatus.sensorType == 1) {                   // Counts the rear tire for pressure sensors and once for PIR
+    sensorDetect = true;                                              // sets the sensor flag for the main loop
+    hourlyAtomic.fetch_add(1, std::memory_order_relaxed);
+    dailyAtomic.fetch_add(1, std::memory_order_relaxed);
     frontTireFlag = false;
+  }
+  else if (sysStatus.sensorType == 2) {
+    static long unsigned lastCountMillis = 0;
+    if (millis() - lastCountMillis >= 700) {                          // Set a standard 700mSec debounce
+      sensorDetect = true;                                            // sets the sensor flag for the main loop
+      hourlyAtomic.fetch_add(1, std::memory_order_relaxed);
+      dailyAtomic.fetch_add(1, std::memory_order_relaxed);
+      lastCountMillis = millis(); 
+    }
   }
   else frontTireFlag = true;
 }
@@ -609,15 +635,16 @@ void loadSystemDefaults() {                                         // Default s
   if (Particle.connected()) publishQueue.publish("Mode","Loading System Defaults", PRIVATE);
   sysStatus.structuresVersion = 1;
   sysStatus.metricUnits = false;
-  sysStatus.verboseMode = true;
+  sysStatus.verboseMode = false;
   if (sysStatus.stateOfCharge < 30) sysStatus.lowBatteryMode = true;
   else sysStatus.lowBatteryMode = false;
-  setLowPowerMode("0");
+  setLowPowerMode("1");
   sysStatus.timezone = -5;                                          // Default is East Coast Time
   sysStatus.dstOffset = 1;
-  sysStatus.openTime = 0;
-  sysStatus.closeTime = 24;
-
+  sysStatus.openTime = 6;
+  sysStatus.closeTime = 21;
+  sysStatus.sensorType = 0;
+  strcpy(sensorTypeConfigStr,"Pressure Sensor");
   fram.put(FRAM::systemStatusAddr,sysStatus);                       // Write it now since this is a big deal and I don't want values over written
 }
 
@@ -628,8 +655,12 @@ void checkSystemValues() {                                          // Checks to
     if (Particle.connected()) sysStatus.connectedStatus = true;
     else sysStatus.connectedStatus = false;
   }
+  if (sysStatus.sensorType > 2) {
+    sysStatus.sensorType = 0;
+    strcpy(sensorTypeConfigStr,"Pressure Sensor");
+  }
   if (sysStatus.verboseMode < 0 || sysStatus.verboseMode > 1) sysStatus.verboseMode = false;
-  if (sysStatus.solarPowerMode < 0 || sysStatus.solarPowerMode >1) sysStatus.solarPowerMode = 0;
+  if (sysStatus.solarPowerMode < 0 || sysStatus.solarPowerMode >1) sysStatus.solarPowerMode = 1;
   if (sysStatus.lowPowerMode < 0 || sysStatus.lowPowerMode > 1) setLowPowerMode("1");
   if (sysStatus.lowBatteryMode < 0 || sysStatus.lowBatteryMode > 1) sysStatus.lowBatteryMode = 0;
   if (sysStatus.stateOfCharge < 30) sysStatus.lowBatteryMode = true;
@@ -757,6 +788,36 @@ int setSolarMode(String command) // Function to force sending data in current ho
     if (Particle.connected()) publishQueue.publish("Mode","Cleared Solar Powered Mode", PRIVATE);
     return 1;
   }
+  else return 0;
+}
+
+int setSensorType(String command) // Function to force sending data in current hour
+{
+  if (command == "0")
+  {
+    sysStatus.sensorType = 0;
+    strcpy(sensorTypeConfigStr,"Pressure Sensor");
+    systemStatusWriteNeeded=true;
+    if (Particle.connected()) publishQueue.publish("Mode","Set Sensor Mode to Pressure", PRIVATE);
+    return 1;
+  }
+  else if (command == "1")
+  {
+    sysStatus.sensorType = 1;
+    strcpy(sensorTypeConfigStr,"PIR Sensor");
+    systemStatusWriteNeeded=true;
+    if (Particle.connected()) publishQueue.publish("Mode","Set Sensor Mode to PIR", PRIVATE);
+    return 1;
+  }
+  else if (command == "2")
+  {
+    sysStatus.sensorType = 2;
+    strcpy(sensorTypeConfigStr,"Legacy Sensor");
+    systemStatusWriteNeeded=true;
+    if (Particle.connected()) publishQueue.publish("Mode","Set Sensor Mode to Legacy", PRIVATE);
+    return 1;
+  }
+
   else return 0;
 }
 
